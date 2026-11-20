@@ -1,0 +1,20 @@
+rules_version = '2';
+// Private profile images. Deploy after provisioning a Blaze Storage bucket.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /users/{uid}/{fileName} {
+      function isOwner() { return request.auth != null && request.auth.uid == uid; }
+      function isProfileFile() { return fileName in ['profile.jpg', 'profile.png', 'profile.webp']; }
+      function isValidImage() {
+        return request.resource.size > 0 && request.resource.size <= 5 * 1024 * 1024
+          && ((fileName == 'profile.jpg' && request.resource.contentType == 'image/jpeg')
+            || (fileName == 'profile.png' && request.resource.contentType == 'image/png')
+            || (fileName == 'profile.webp' && request.resource.contentType == 'image/webp'));
+      }
+      allow read: if isOwner() && isProfileFile();
+      allow create, update: if isOwner() && isProfileFile() && isValidImage();
+      allow delete: if isOwner() && isProfileFile();
+    }
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}

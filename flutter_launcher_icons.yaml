@@ -1,0 +1,10 @@
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/launcher/ma7aly_launcher.png
+  remove_alpha_ios: true
+  background_color_ios: "#FFD43B"
+  adaptive_icon_background: "#FFD43B"
+  adaptive_icon_foreground: assets/launcher/ma7aly_launcher_foreground.png
+  adaptive_icon_foreground_inset: 0
+  adaptive_icon_monochrome: assets/launcher/ma7aly_launcher_foreground.png

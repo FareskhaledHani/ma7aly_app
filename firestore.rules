@@ -1,0 +1,189 @@
+rules_version = '2';
+// Private data model (all amounts are integer piastres; quantities are thousandths).
+// users/{uid}: name <=100, phone 6..24, Auth email <=254, immutable createdAt,
+// optional owner-scoped photoPath <=256. No roles or public profile fields.
+// customers/{22-char id}: immutable identity/opening balance/schedule; optional
+// balanceMinor +/-999999999999 and lastMovementId updated only with its movement.
+// movements/{22-char id}: kind, amountMinor 1..999999999999, business date,
+// revision 1..1000000000, deleted tombstone, immutable createdAt, updatedAt.
+// Optional quantityMilli 1..999999999, unit <=24, unitPriceMinor >=0,
+// note <=300, paymentMethod <=50, productId/name <=100. No hard deletes.
+// products/{22-char id}: name/nameKey <=100, unit <=24, prices 0..999999999999,
+// trackInventory, stockMilli +/-999999999, lowStockMilli 0..999999999,
+// extraUnit <=100, immutable createdAt. Stock changes require a linked movement.
+// settings/shop: shopName <=100, phone <=24, minimumPaymentPercent 1..100,
+// warningDays 0..30, updatedAt server timestamp. All other paths denied.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function owner(uid) { return request.auth != null && request.auth.uid == uid; }
+    function ownsData(uid) { return owner(uid) && exists(/databases/$(database)/documents/users/$(uid)); }
+    function recordId(id) { return id is string && id.matches('[A-Za-z0-9_-]{22}'); }
+    function text(value, max) { return value is string && value.size() > 0 && value.size() <= max; }
+    function optionalText(data, key, max) { return !(key in data) || text(data[key], max); }
+    function integer(value, min, max) { return value is int && value >= min && value <= max; }
+    function customerPath(uid, cid) { return /databases/$(database)/documents/users/$(uid)/customers/$(cid); }
+    function movementPath(uid, cid, mid) { return /databases/$(database)/documents/users/$(uid)/customers/$(cid)/movements/$(mid); }
+    function productPath(uid, pid) { return /databases/$(database)/documents/users/$(uid)/products/$(pid); }
+    function previousMovement(uid, cid, mid) {
+      return exists(movementPath(uid, cid, mid)) ? get(movementPath(uid, cid, mid)).data : {};
+    }
+    function delta(m) { return !('kind' in m) || m.deleted ? 0 : (m.kind == 'withdrawal' ? m.amountMinor : -m.amountMinor); }
+    function quantity(m, pid) {
+      return 'kind' in m && !m.deleted && m.trackedInventory && m.get('productId', '') == pid ? m.quantityMilli : 0;
+    }
+    function changedMovement(before, after) {
+      return after.updatedAt == request.time &&
+        (!('kind' in before) ? after.revision == 1 : !before.deleted && after.revision == before.revision + 1);
+    }
+    function validUser(data, uid) {
+      return data.keys().hasAll(['name', 'phone', 'email', 'createdAt'])
+        && data.keys().hasOnly(['name', 'phone', 'email', 'createdAt', 'photoPath'])
+        && text(data.name, 100) && text(data.phone, 24) && data.phone.size() >= 6
+        && data.phone.matches('[+]?[0-9][0-9 ()-]{5,23}')
+        && text(data.email, 254) && data.email == request.auth.token.email
+        && data.createdAt is timestamp
+        && (!('photoPath' in data) || (text(data.photoPath, 256) && data.photoPath in [
+          'users/' + uid + '/profile.jpg', 'users/' + uid + '/profile.png', 'users/' + uid + '/profile.webp']));
+    }
+    function validCustomer(data) {
+      return data.keys().hasAll(['name', 'nameKey', 'phoneKey', 'openingBalanceMinor', 'dueDate', 'frequency', 'createdAt'])
+        && data.keys().hasOnly(['name', 'nameKey', 'phoneKey', 'phone', 'description', 'openingBalanceMinor', 'dueDate', 'frequency', 'repaymentDay', 'createdAt', 'balanceMinor', 'lastMovementId'])
+        && text(data.name, 100) && text(data.nameKey, 100)
+        && data.phoneKey is string && data.phoneKey.size() <= 24 && data.phoneKey.matches('[0-9]*')
+        && (!('phone' in data) || (text(data.phone, 24) && data.phone.size() >= 6 && data.phone.matches('[+]?[0-9][0-9 ()-]{5,23}')))
+        && optionalText(data, 'description', 300)
+        && integer(data.openingBalanceMinor, 0, 999999999999)
+        && data.dueDate is timestamp && data.dueDate >= timestamp.date(2000, 1, 1) && data.dueDate < timestamp.date(2101, 1, 1)
+        && data.createdAt is timestamp
+        && ((data.frequency == 'monthly' && integer(data.repaymentDay, 1, 31))
+          || (data.frequency == 'weekly' && integer(data.repaymentDay, 1, 7))
+          || (data.frequency == 'once' && !('repaymentDay' in data)))
+        && (!('balanceMinor' in data) || integer(data.balanceMinor, -999999999999, 999999999999))
+        && (!('lastMovementId' in data) || recordId(data.lastMovementId));
+    }
+    function validProduct(data) {
+      return data.keys().hasAll(['name', 'nameKey', 'unit', 'priceMinor', 'trackInventory', 'stockMilli', 'lowStockMilli', 'createdAt'])
+        && data.keys().hasOnly(['name', 'nameKey', 'unit', 'priceMinor', 'costMinor', 'trackInventory', 'stockMilli', 'lowStockMilli', 'extraUnit', 'createdAt', 'lastMovementId', 'lastMovementCustomerId'])
+        && text(data.name, 100) && text(data.nameKey, 100) && text(data.unit, 24)
+        && integer(data.priceMinor, 0, 999999999999)
+        && (!('costMinor' in data) || integer(data.costMinor, 0, 999999999999))
+        && data.trackInventory is bool && integer(data.stockMilli, -999999999, 999999999)
+        && integer(data.lowStockMilli, 0, 999999999)
+        && (data.trackInventory || (data.stockMilli == 0 && data.lowStockMilli == 0))
+        && optionalText(data, 'extraUnit', 100) && data.createdAt is timestamp
+        && (!('lastMovementId' in data) || recordId(data.lastMovementId))
+        && (!('lastMovementCustomerId' in data) || recordId(data.lastMovementCustomerId));
+    }
+    function validMovement(data) {
+      return data.keys().hasAll(['kind', 'amountMinor', 'date', 'revision', 'deleted', 'trackedInventory', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['kind', 'amountMinor', 'date', 'quantityMilli', 'unit', 'unitPriceMinor', 'note', 'paymentMethod', 'productId', 'productName', 'trackedInventory', 'revision', 'deleted', 'createdAt', 'updatedAt'])
+        && data.kind in ['withdrawal', 'payment'] && integer(data.amountMinor, 1, 999999999999)
+        && data.date is timestamp && data.date >= timestamp.date(2000, 1, 1) && data.date < timestamp.date(2101, 1, 1)
+        && integer(data.revision, 1, 1000000000) && data.deleted is bool && data.trackedInventory is bool
+        && data.createdAt is timestamp && data.updatedAt is timestamp
+        && (!('quantityMilli' in data) || integer(data.quantityMilli, 1, 999999999))
+        && (!('unitPriceMinor' in data) || integer(data.unitPriceMinor, 0, 999999999999))
+        && optionalText(data, 'unit', 24) && optionalText(data, 'note', 300)
+        && optionalText(data, 'paymentMethod', 50) && optionalText(data, 'productName', 100)
+        && (!('productId' in data) || (recordId(data.productId) && text(data.productName, 100) && text(data.unit, 24) && 'quantityMilli' in data))
+        && ('productId' in data || !data.trackedInventory)
+        && (data.kind == 'withdrawal' ? !('paymentMethod' in data)
+          : (text(data.paymentMethod, 50) && !data.trackedInventory && !data.keys().hasAny(['quantityMilli', 'unit', 'unitPriceMinor', 'productId', 'productName'])))
+        && (!('quantityMilli' in data && 'unitPriceMinor' in data) ||
+          data.amountMinor == int((data.quantityMilli * data.unitPriceMinor + 500) / 1000));
+    }
+    function validProductLink(uid, data) {
+      let found = 'productId' in data && exists(productPath(uid, data.productId));
+      let p = found ? get(productPath(uid, data.productId)).data : {};
+      return data.deleted || !('productId' in data) || (found && data.productName == p.name && data.unit == p.unit && data.trackedInventory == p.trackInventory);
+    }
+    function stockFollows(uid, pid, before, after) {
+      let productBefore = get(productPath(uid, pid)).data;
+      let productAfter = getAfter(productPath(uid, pid)).data;
+      return productAfter.stockMilli == productBefore.stockMilli + quantity(before, pid) - quantity(after, pid);
+    }
+    function stocksFollow(uid, before, after) {
+      return (!('kind' in before) || !before.trackedInventory || stockFollows(uid, before.productId, before, after))
+        && (!after.trackedInventory || stockFollows(uid, after.productId, before, after));
+    }
+    function customerFollows(uid, cid, mid, before, after) {
+      let customerBefore = get(customerPath(uid, cid)).data;
+      let customerAfter = getAfter(customerPath(uid, cid)).data;
+      return customerAfter.lastMovementId == mid && customerAfter.balanceMinor ==
+        customerBefore.get('balanceMinor', customerBefore.openingBalanceMinor) - delta(before) + delta(after);
+    }
+    function validSettings(data) {
+      return data.keys().hasAll(['shopName', 'phone', 'minimumPaymentPercent', 'warningDays', 'updatedAt'])
+        && data.keys().hasOnly(['shopName', 'phone', 'minimumPaymentPercent', 'warningDays', 'updatedAt'])
+        && data.shopName is string && data.shopName.size() <= 100
+        && data.phone is string && data.phone.size() <= 24
+        && (data.phone == '' || data.phone.matches('[+]?[0-9][0-9 ()-]{5,23}'))
+        && integer(data.minimumPaymentPercent, 1, 100) && integer(data.warningDays, 0, 30)
+        && data.updatedAt == request.time;
+    }
+    match /users/{uid} {
+      allow get: if owner(uid);
+      allow list: if false;
+      allow create: if owner(uid) && validUser(request.resource.data, uid) && request.resource.data.createdAt == request.time;
+      allow update: if owner(uid) && validUser(request.resource.data, uid) && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if owner(uid);
+      match /settings/{settingId} {
+        allow read: if ownsData(uid) && settingId == 'shop';
+        allow create, update: if ownsData(uid) && settingId == 'shop' && validSettings(request.resource.data);
+        allow delete: if false;
+      }
+      match /customers/{cid} {
+        function balanceUpdate() {
+          let mid = request.resource.data.lastMovementId;
+          let before = previousMovement(uid, cid, mid);
+          let after = getAfter(movementPath(uid, cid, mid)).data;
+          return changedMovement(before, after) && customerFollows(uid, cid, mid, before, after);
+        }
+        allow read: if ownsData(uid);
+        allow create: if ownsData(uid) && recordId(cid) && validCustomer(request.resource.data)
+          && request.resource.data.createdAt == request.time && !request.resource.data.keys().hasAny(['balanceMinor', 'lastMovementId']);
+        allow update: if ownsData(uid) && validCustomer(request.resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balanceMinor', 'lastMovementId'])
+          && balanceUpdate();
+        allow delete: if false;
+        match /movements/{mid} {
+          function ownsAccount() { return ownsData(uid) && exists(customerPath(uid, cid)); }
+          function linkedWrite(before, after) {
+            return customerFollows(uid, cid, mid, before, after) && stocksFollow(uid, before, after);
+          }
+          allow read: if ownsAccount();
+          allow create: if ownsAccount() && recordId(mid) && validMovement(request.resource.data)
+            && request.resource.data.revision == 1 && !request.resource.data.deleted
+            && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time
+            && validProductLink(uid, request.resource.data) && linkedWrite({}, request.resource.data);
+          allow update: if ownsAccount() && validMovement(request.resource.data)
+            && changedMovement(resource.data, request.resource.data)
+            && request.resource.data.createdAt == resource.data.createdAt && request.resource.data.kind == resource.data.kind
+            && (!request.resource.data.deleted || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['deleted', 'revision', 'updatedAt']))
+            && validProductLink(uid, request.resource.data) && linkedWrite(resource.data, request.resource.data);
+          allow delete: if false;
+        }
+      }
+      match /products/{pid} {
+        function stockUpdate() {
+          let mid = request.resource.data.lastMovementId;
+          let cid = request.resource.data.lastMovementCustomerId;
+          let before = previousMovement(uid, cid, mid);
+          let after = getAfter(movementPath(uid, cid, mid)).data;
+          return changedMovement(before, after) && ownsData(uid) && exists(customerPath(uid, cid))
+            && request.resource.data.stockMilli == resource.data.stockMilli + quantity(before, pid) - quantity(after, pid)
+            && request.resource.data.stockMilli != resource.data.stockMilli;
+        }
+        allow read: if ownsData(uid);
+        allow create: if ownsData(uid) && recordId(pid) && validProduct(request.resource.data)
+          && request.resource.data.stockMilli >= 0 && request.resource.data.createdAt == request.time
+          && !request.resource.data.keys().hasAny(['lastMovementId', 'lastMovementCustomerId']);
+        allow update: if ownsData(uid) && validProduct(request.resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['stockMilli', 'lastMovementId', 'lastMovementCustomerId'])
+          && stockUpdate();
+        allow delete: if false;
+      }
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
